@@ -214,7 +214,7 @@ def cross_validate(X, Y, groups, num_votes, n_folds, seed):
 # ----------------------------------------------------------------------------- main
 def main():
     parser = argparse.ArgumentParser(description="HMS simple scikit-learn baseline")
-    parser.add_argument("--data-dir", type=Path, required=True,
+    parser.add_argument("--data-dir", type=Path,default=Path(__file__).resolve().parent,
                         help="folder that contains train.csv, test.csv, train_spectrograms/ and test_spectrograms/")
     parser.add_argument("--mode", choices=["full", "quick"], default="full",
                         help="full: all training spectrograms; quick: a random 3,000 for a fast check")

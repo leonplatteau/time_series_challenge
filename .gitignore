@@ -5,3 +5,11 @@ __pycache__/
 submission.csv
 .ipynb_checkpoints/
 .DS_Store
+# EEG / spectrogram data
+*.parquet
+train_eegs/
+test_eegs/
+train_spectrograms/
+test_spectrograms/
+train.csv
+test.csv

@@ -77,7 +77,7 @@ def align_probabilities(model, X, n_classes=6):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", type=Path, default=Path("/kaggle/input/hms-harmful-brain-activity-classification"))
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).parent)
     parser.add_argument("--max-train", type=int, default=2000, help="Limit examples for a quick classroom run; 0 uses all rows")
     parser.add_argument("--submission", action="store_true", help="Also predict the provided test EEGs")
     args = parser.parse_args()
