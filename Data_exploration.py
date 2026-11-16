@@ -41,14 +41,23 @@ print("There's ", Other, "Other votes")
 # idealized = if more than k of experts pick the same category
 #proto = if between (1-k) and k of experts pick "other"
 # edge = if votes are around equally distributed between two of the five real categories (not "other") (1-k<x<k)
-def add_case_type(df,k):
-    df["patterns"] = df["expert_consensus"] #first: making the new column
-    for label in df["label_id"]:
-        if max(df["seizure_vote"][label],df["LPD_vote"],df["GPD_vote"],df["LRDA_vote"],df["GRDA_vote"])/df["total_votes"] > k:
-            case = "idealized"
-        elif 1-k < df["other_vote"][label] < k:
-            case = "proto"
-        else:
-            case = "edge"
-        df["patterns"][label] = case
-add_case_type(df,0.8)
+VOTES = ["seizure_vote", "lpd_vote", "gpd_vote", "lrda_vote", "grda_vote", "other_vote"]
+NAMED = VOTES[:5]
+
+def add_case_type(df, k):
+    df = df.copy()
+    total = df[VOTES].sum(axis=1)                      # total number of votes per row
+    share = df[VOTES].div(total, axis=0)               # fraction of experts per class
+    other = share["other_vote"]
+    named_sorted = np.sort(share[NAMED].to_numpy(), axis=1)[:, ::-1]
+    top2 = named_sorted[:, 1]                          # second-largest of the five real classes
+
+    idealized = share.max(axis=1) > k                  # any class (incl. other) above k
+    proto = ~idealized & (other > 1 - k) & (other < k)
+    edge = ~idealized & ~proto & (top2 > 1 - k)
+
+    df["case_type"] = np.select([idealized, proto, edge], ["idealized", "proto", "edge"], default=None)
+    return df
+
+df_extended = add_case_type(df, 0.8)
+print(df_extended.head())
