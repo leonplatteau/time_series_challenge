@@ -37,4 +37,18 @@ print("There's ", LRDAs, "LRDA votes")
 print("There's ", GRDAs, "GRDA votes")
 print("There's ", Other, "Other votes")
 
-#
+# Looking at idealized/proto/edge cases (k is a number between 0.50 and 1)
+# idealized = if more than k of experts pick the same category
+#proto = if between (1-k) and k of experts pick "other"
+# edge = if votes are around equally distributed between two of the five real categories (not "other") (1-k<x<k)
+def add_case_type(df,k):
+    df["patterns"] = df["expert_consensus"] #first: making the new column
+    for label in df["label_id"]:
+        if max(df["seizure_vote"][label],df["LPD_vote"],df["GPD_vote"],df["LRDA_vote"],df["GRDA_vote"])/df["total_votes"] > k:
+            case = "idealized"
+        elif 1-k < df["other_vote"][label] < k:
+            case = "proto"
+        else:
+            case = "edge"
+        df["patterns"][label] = case
+add_case_type(df,0.8)
