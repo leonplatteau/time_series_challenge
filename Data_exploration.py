@@ -4,10 +4,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.signal import welch
+import matplotlib.pyplot as plt
+from scipy.signal import butter, sosfiltfilt, spectrogram,welch
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, log_loss
 from sklearn.model_selection import GroupShuffleSplit
+import matplotlib.pyplot as plt
 
 #Loading file in Python
 map_van_script = Path(__file__).parent
@@ -59,5 +61,75 @@ def add_case_type(df, k):
     df["case_type"] = np.select([idealized, proto, edge], ["idealized", "proto", "edge"], default=None)
     return df
 
-df_extended = add_case_type(df, 0.8)
-print(df_extended.head())
+df_extended = add_case_type(df, 0.51)
+idealized_count = (df_extended["case_type"] == "idealized").sum()
+proto_count = (df_extended["case_type"] == "proto").sum()
+edge_count = (df_extended["case_type"] == "edge").sum()
+total = idealized_count + proto_count + edge_count
+idealized_ratio = idealized_count/total
+proto_ratio = proto_count/total
+edge_ratio = edge_count/total
+print(idealized_count, "or", idealized_ratio)
+print(proto_count, "or", proto_ratio)
+print(edge_count, "or", edge_ratio)
+
+#plotting a spectrogram (coded by Claude)
+FS = 200  # samplefrequentie (Hz)
+BANDS = [(0.5, 4), (4, 8), (8, 13), (13, 30)]  # delta, theta, alpha, beta
+
+
+def plot_eeg_overview(eeg_path, offset=0.0, channels=("Fp1", "T3", "O1", "Fp2", "T4", "O2"),
+                      spec_channel="T3", save_to=None):
+    """Overzichtsplot van één EEG-bestand.
+
+    offset: eeg_label_offset_seconds uit train.csv. De gearceerde zone is het
+            gelabelde venster (offset+20 s tot offset+30 s).
+    """
+    eeg_path = Path(eeg_path)
+    df = pd.read_parquet(eeg_path)
+    eeg = df.drop(columns="EKG", errors="ignore")      # enkel hersenkanalen
+    t = np.arange(len(df)) / FS
+
+    # Bandpass 0,5-40 Hz om drift en 60 Hz-ruis te verwijderen (enkel voor de plot)
+    sos = butter(4, [0.5, 40], btype="band", fs=FS, output="sos")
+    filt = pd.DataFrame(sosfiltfilt(sos, eeg.to_numpy(float), axis=0), columns=eeg.columns)
+
+    fig, ax = plt.subplots(3, 1, figsize=(11, 10))
+
+    # 1) tijdreeksen, onder elkaar gestapeld
+    spacing = 400
+    for i, ch in enumerate(channels):
+        ax[0].plot(t, filt[ch] - i * spacing, lw=0.5)
+    ax[0].set_yticks([-i * spacing for i in range(len(channels))])
+    ax[0].set_yticklabels(channels)
+    ax[0].axvspan(offset + 20, offset + 30, alpha=0.15)
+    ax[0].set_xlabel("s")
+    ax[0].set_title(f"Bandpassed (0.5-40 Hz) EEG, {len(df) / FS:.0f} s; "
+                    f"gearceerd = gelabeld 10 s-venster (offset={offset:g})")
+
+    # 2) spectrogram van één kanaal
+    f_s, t_s, S = spectrogram(filt[spec_channel].to_numpy(), fs=FS, nperseg=400, noverlap=200)
+    m = f_s <= 20
+    ax[1].pcolormesh(t_s, f_s[m], 10 * np.log10(S[m] + 1e-9), shading="auto")
+    ax[1].set_title(f"Spectrogram {spec_channel} (dB)")
+    ax[1].set_ylabel("Hz")
+    ax[1].set_xlabel("s")
+
+    # 3) gemiddeld vermogensspectrum over alle kanalen (ruwe data, dus 60 Hz-piek zichtbaar)
+    f, p = welch(eeg.to_numpy(float), fs=FS, nperseg=512, axis=0)
+    pm = p.mean(axis=1)
+    ax[2].semilogy(f[f < 60], pm[f < 60])
+    for low, high in BANDS:
+        ax[2].axvspan(low, high, alpha=0.1)
+    ax[2].set_title("Gemiddelde PSD over kanalen (Welch)")
+    ax[2].set_xlabel("Hz")
+
+    plt.tight_layout()
+    if save_to:
+        plt.savefig(save_to, dpi=110)
+    plt.show()
+    return fig
+if __name__ == "__main__":
+    train = pd.read_csv("train.csv")
+    rij = train[train.eeg_id == 568657].iloc[0]
+    plot_eeg_overview(r"C:\Users\leonp\Documents\KUL\3.1\AI\train_eegs\568657.parquet", offset=rij.eeg_label_offset_seconds)
