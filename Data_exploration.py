@@ -131,5 +131,14 @@ def plot_eeg_overview(eeg_path, offset=0.0, channels=("Fp1", "T3", "O1", "Fp2", 
     return fig
 if __name__ == "__main__":
     train = pd.read_csv("train.csv")
-    rij = train[train.eeg_id == 568657].iloc[0]
-    plot_eeg_overview(r"C:\Users\leonp\Documents\KUL\3.1\AI\train_eegs\568657.parquet", offset=rij.eeg_label_offset_seconds)
+    rij = train[train.eeg_id == 55276269].iloc[0]
+    plot_eeg_overview(r"C:\Users\leonp\time_series_challenge\train_eegs\55276269.parquet", offset=rij.eeg_label_offset_seconds,save_to="eeg_55276269_overview.png") #Other
+    rij = train[train.eeg_id == 289371912].iloc[0]
+    plot_eeg_overview(r"C:\Users\leonp\time_series_challenge\train_eegs\289371912.parquet", offset=rij.eeg_label_offset_seconds, save_to="eeg_289371912_overview.png") #Seizure
+    rij = train[train.eeg_id == 266631836].iloc[0]
+    plot_eeg_overview(r"C:\Users\leonp\time_series_challenge\train_eegs\266631836.parquet", offset=rij.eeg_label_offset_seconds, save_to="eeg_266631836_overview.png") #Seizure  
+    rij = train[train.eeg_id == 3358839663].iloc[0]
+    plot_eeg_overview(r"C:\Users\leonp\time_series_challenge\train_eegs\3358839663.parquet", offset=rij.eeg_label_offset_seconds, save_to="eeg_3358839663_overview.png") #GRDA
+    print("Done")
+
+    
