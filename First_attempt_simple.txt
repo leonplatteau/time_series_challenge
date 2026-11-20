@@ -1,0 +1,16 @@
+#This is the first attempt to go through the whole process of building a classification model.
+#In this attempt, some aspects are already covered, while others are kept behind for a better model.
+# Build-up of the code:
+# (0) Initialization: loading all packages, loading all files, defining invariant parameters.
+# (1) Preprocessing1: defining extra necessary columns in dataframe:
+#       This is mainly on amount of votes
+# (2) Preprocessing2: filtering the EEG signals (bandpass 0.5-40Hz --> in literature (https://www.researchgate.net/publication/384165067_Advancing_Emotional_Health_Assessments_A_Hybrid_Deep_Learning_Approach_Using_Physiological_Signals_for_Robust_Emotion_Recognition))
+# (3) Feature-extraction: in one function, all relevant features are calculated for an input (preprocessed) EEG
+# (4) Appplying the actual model: HistGradientBoostingClassifier 
+#       --> This is the same as in the hms_sklearn_baseline file, but with a different preprocessing, the result hopefully gets better.
+# (5) Cross-validation.
+# This is not yet the final attempt, but is a first try into building a model by myself. 
+# Maybe it's even worse than the baseline, but hopefully another try can make it better then.
+
+
+# (0): INITIALIZATION
