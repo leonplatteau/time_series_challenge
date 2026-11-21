@@ -127,3 +127,158 @@ def load_eeg_window(path, mid_offset, window_seconds, use_filter):
     c0 = (n_seg - w) // 2
     return seg[c0:c0 + w]
 
+
+# (3): FEATURE EXTRACTION
+def eeg_features(window): #AI-generated code
+    """All EEG features for one preprocessed window of shape (samples, 19). 228 features:
+
+    per channel (19 x 10 = 190): log band power (4), relative band power (4), std, line length
+    asymmetry (8 pairs x 4 bands = 32): log power left minus right
+    global (6): mean over channels of the 4 log band powers, mean std, mean line length
+    """
+    freqs, psd = welch(window, fs=FS, nperseg=2 * FS, axis=0)             # psd: (frequencies, channels)
+    band_power = np.stack([psd[(freqs >= lo) & (freqs < hi)].sum(axis=0) for lo, hi in EEG_BANDS.values()])
+    log_power = np.log(band_power + EPS)                                   # (4 bands, 19 channels)
+    rel_power = band_power / (band_power.sum(axis=0, keepdims=True) + EPS)
+    std = window.std(axis=0)
+    line_length = np.abs(np.diff(window, axis=0)).mean(axis=0)             # mean |dx|: independent of window length
+    ch = {name: i for i, name in enumerate(EEG_CHANNELS)}
+
+    feats = {}
+    for name, j in ch.items():
+        for k, band in enumerate(EEG_BANDS):
+            feats[f"{name}_{band}_logpow"] = log_power[k, j]
+            feats[f"{name}_{band}_relpow"] = rel_power[k, j]
+        feats[f"{name}_std"] = std[j]
+        feats[f"{name}_linelen"] = line_length[j]
+    for left, right in HOMOLOGOUS_PAIRS:
+        for k, band in enumerate(EEG_BANDS):
+            feats[f"asym_{left}_{right}_{band}"] = log_power[k, ch[left]] - log_power[k, ch[right]]
+    for k, band in enumerate(EEG_BANDS):
+        feats[f"global_{band}_logpow"] = log_power[k].mean()
+    feats["global_std"] = std.mean()
+    feats["global_linelen"] = line_length.mean()
+    return feats
+
+
+def eeg_row(eeg_id, path, mid_offset, window_seconds, use_filter): #AI-generated code
+    """Preprocess one EEG file and compute its features (a failing file gives NaN features, not a crash)."""
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    try:
+        feats = eeg_features(load_eeg_window(path, mid_offset, window_seconds, use_filter))
+    except Exception as err:
+        print(f"warning: EEG {eeg_id} failed ({err})")
+        feats = {}
+    feats["eeg_id"] = eeg_id
+    return feats
+
+
+def compute_eeg_features(meta, eeg_dir, window_seconds, use_filter, is_test, n_jobs): #AI-generated code
+    """EEG features for all rows of `meta`, one file per job, in parallel."""
+    t0 = time.time()
+    mids = np.zeros(len(meta)) if is_test else meta["eeg_mid"].to_numpy()
+    jobs = [delayed(eeg_row)(e, eeg_dir / f"{e}.parquet", m, window_seconds, use_filter)
+            for e, m in zip(meta["eeg_id"], mids)]
+    out = pd.DataFrame(Parallel(n_jobs=n_jobs, batch_size=32)(jobs))
+    print(f"EEG features: {len(out)} rows x {out.shape[1] - 1} features in {time.time() - t0:.0f}s")
+    return out
+
+
+def band_columns(columns): #same as hms_sklearn_baseline
+    """Return {(region, band): [column indices]} for the 400 spectrogram columns like 'LL_1.17'."""
+    out = {}
+    for r in REGIONS:
+        for b, (lo, hi) in BANDS.items():
+            out[(r, b)] = [i for i, c in enumerate(columns)
+                           if c.startswith(r + "_") and lo <= float(c.split("_")[1]) < hi]
+    return out
+
+
+def spec_window_features(spec, cols): #cfr hms_sklearn_baseline
+    """The 88 baseline features for one 10-minute spectrogram window (time steps x 400)."""
+    feats = {}
+    total = {r: 0.0 for r in REGIONS}
+    band_power = {}
+    for (r, b), idx in cols.items():
+        p = np.nanmean(spec[:, idx], axis=1)                    # mean power in the band, per time step
+        lp = np.log1p(np.nan_to_num(p, nan=0.0).clip(min=0))    # log scale; missing values -> 0
+        feats[f"{r}_{b}_mean"] = lp.mean()
+        feats[f"{r}_{b}_std"] = lp.std()
+        feats[f"{r}_{b}_min"] = lp.min()
+        feats[f"{r}_{b}_max"] = lp.max()
+        band_power[(r, b)] = np.nanmean(p) if np.isfinite(p).any() else 0.0
+        total[r] += band_power[(r, b)]
+    for (r, b), v in band_power.items():                        # share of the region's total power
+        feats[f"{r}_{b}_rel"] = v / (total[r] + 1e-6)           
+    for b in SPEC_BANDS:                                        # left minus right hemisphere
+        feats[f"asym_lat_{b}"] = feats[f"LL_{b}_mean"] - feats[f"RL_{b}_mean"]
+        feats[f"asym_par_{b}"] = feats[f"LP_{b}_mean"] - feats[f"RP_{b}_mean"]
+    return feats
+
+
+def spectrogram_features(path, windows, is_test): #identical to hms_sklearn_baseline
+    """Read one spectrogram file once and compute features for every EEG that uses it."""
+    warnings.filterwarnings("ignore", category=RuntimeWarning)
+    spec = pd.read_parquet(path)
+    cols = band_columns(list(spec.columns[1:]))
+    spec = spec.iloc[:, 1:].to_numpy(dtype=np.float32)          # drop the 'time' column
+    rows = []
+    for eeg_id, off_min, off_max in windows:
+        if is_test:
+            # Test spectrograms are short and centred on the segment: take their middle 10 minutes.
+            start = max(0, (len(spec) - 300) // 2)
+        else:
+            # Training spectrograms cover the whole recording. Start at the midpoint of the labelled
+            # offsets; offsets are in seconds and rows are 2 s apart, hence the division by 4 (= /2 /2).
+            start = int((off_min + off_max) // 4)
+        feats = window_features(spec[start:start + 300], cols)
+        feats["eeg_id"] = eeg_id
+        rows.append(feats)
+    return rows
+
+def compute_spec_features(meta, spec_dir, is_test, n_jobs): #AI-generated code
+    """Spectrogram features for all rows of `meta` (columns prefixed with 'spec_')."""
+    t0 = time.time()
+    if is_test:
+        meta = meta.assign(spec_off_min=0.0, spec_off_max=0.0)
+    jobs = [delayed(spectrogram_features)(spec_dir / f"{sid}.parquet",
+                                          list(zip(g.eeg_id, g.spec_off_min, g.spec_off_max)), is_test)
+            for sid, g in meta.groupby("spectrogram_id")]
+    results = Parallel(n_jobs=n_jobs, batch_size=32)(jobs)
+    out = pd.DataFrame([row for rows in results for row in rows])
+    out = out.rename(columns=lambda c: c if c == "eeg_id" else f"spec_{c}")
+    print(f"Spectrogram features: {len(jobs)} files -> {len(out)} rows in {time.time() - t0:.0f}s")
+    return out
+
+
+def cached(path, compute): #AI-generated code
+    """Load a feature table from the cache if present, otherwise compute (and store) it."""
+    if path is not None and path.exists():
+        print(f"loaded cached features: {path}")
+        return pd.read_parquet(path)
+    df = compute()
+    if path is not None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        df.to_parquet(path)
+    return df
+
+
+def build_features(meta, data_dir, args, is_test=False): #cfr hms_sklearn_baseline
+    """Complete feature table (EEG features, plus spectrogram features unless --no-spec) for `meta`."""
+    split = "test" if is_test else "train"
+    cache_dir = None if args.no_cache else args.cache_dir
+    tag = f"n{len(meta)}_s{args.seed}"
+    path = lambda name: None if cache_dir is None else cache_dir / name
+
+    out = cached(path(f"eeg_{split}_{tag}_filter{int(args.filter)}_win{args.window}.parquet"),
+                 lambda: compute_eeg_features(meta, data_dir / f"{split}_eegs", args.window,
+                                              args.filter, is_test, args.n_jobs))
+    if args.spec:
+        spec = cached(path(f"spec_{split}_{tag}.parquet"),
+                      lambda: compute_spec_features(meta, data_dir / f"{split}_spectrograms",
+                                                    is_test, args.n_jobs))
+        out = out.merge(spec, on="eeg_id", how="left")
+    return out
+
+
+
