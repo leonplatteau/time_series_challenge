@@ -330,31 +330,113 @@ def build_image_cache(df, data_dir, args, is_test=False):
     return out, index
 
 
-# (3): REPRESENTATION -- dataset, augmentation, loaders
+# (3): REPRESENTATION -- dataset, augmentation, loaders (AI-generated)
+SHIFT_FRAC = 0.05            # time-shift augmentation: up to 5% of the image width
+FLIP_PROB = 0.5              # probability of mirroring left <-> right
+
+
 def augment_flip_lr(img):
-    """[medium] Mirror left <-> right: swap chains LL<->RL and LP<->RP (labels are not side-specific).
-    Correctness depends on the chain order of the image: check it on a toy example."""
-    raise NotImplementedError
+    """Mirror left <-> right: img (4 chains, freq, time) in chain order LL, LP, RP, RL.
+
+    Reversing the chain axis gives RL, RP, LP, LL, i.e. LL<->RL and LP<->RP. The labels are not side-specific
+    (a left-sided LPD mirrored is a right-sided LPD, still an LPD), so the target stays the same.
+    """
+    return np.ascontiguousarray(img[::-1])
 
 
 def augment_time_shift(img, max_shift):
-    """[easy] Random roll / crop along the time axis (small shifts)."""
-    raise NotImplementedError
+    """Random shift along the time axis by -max_shift ... +max_shift steps; the gap is filled with the edge column
+    (np.roll would wrap the end of the recording around to the start, which creates a false discontinuity)."""
+    if max_shift <= 0:
+        return img
+    shift = np.random.randint(-max_shift, max_shift + 1)
+    if shift == 0:
+        return img
+    padded = np.pad(img, ((0, 0), (0, 0), (max_shift, max_shift)), mode="edge")
+    start = max_shift + shift
+    return padded[:, :, start:start + img.shape[2]]
+
+
+def normalize_image(img):
+    """Fixed scaling of the log-power images from [LOG_MIN, LOG_MAX] to [-1, 1] (same for train and test, no statistics
+    are learned from the data). DECISION to revisit later: per-image standardisation."""
+    return (img - LOG_MIN) / (LOG_MAX - LOG_MIN) * 2.0 - 1.0
+
+
+def image_to_layout(img, layout):
+    """channels: keep (4, freq, time). stacked: put the chains below each other -> (1, 4 * freq, time)."""
+    if layout == "channels":
+        return img
+    return img.reshape(1, -1, img.shape[2])
+
+
+def n_input_channels(args):
+    """Number of input channels of the network: 4 (one per chain) or 1 (chains stacked into one image)."""
+    return len(CHAIN_ORDER) if args.image_layout == "channels" else 1
 
 
 class HMSDataset(Dataset):
-    """[medium] Returns (image tensor, target distribution (6), sample weight).
-    __init__(images, index, df, rows, train, args): `rows` = which rows of df to use (fold / stage subset)
-    __getitem__: load image (float16 -> float32), augment if train, to tensor;
-                 weight = df.vote_weight if args stage 1 else 1.0
+    """Returns (image tensor, target distribution (6), sample weight) for the chosen rows of df.
+
+    images, index: output of build_image_cache. rows: positions in df (a fold, or a stage-2 subset).
+    train: augment (flip + time shift) when args.augment is on. use_weights: weight = vote_weight (stage 1), else 1.
+    A df without vote columns (test.csv) gives all-zero targets.
     """
-    def __init__(self, *a, **k):
-        raise NotImplementedError
+
+    def __init__(self, images, index, df, rows, train, args, use_weights=False):
+        self.images = images
+        self.rows = np.asarray(rows)
+        self.img_rows = np.array([index[int(e)] for e in df["eeg_id"].to_numpy()[self.rows]])
+        has_targets = all(c in df.columns for c in CLASSES)
+        self.targets = (df[CLASSES].to_numpy(dtype=np.float32)[self.rows] if has_targets
+                        else np.zeros((len(self.rows), len(CLASSES)), dtype=np.float32))
+        self.weights = (df["vote_weight"].to_numpy(dtype=np.float32)[self.rows] if use_weights
+                        else np.ones(len(self.rows), dtype=np.float32))
+        self.augment = bool(train and args.augment)
+        self.layout = args.image_layout
+        self.max_shift = int(SHIFT_FRAC * images.shape[-1])
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        img = np.asarray(self.images[self.img_rows[i]], dtype=np.float32)       # float16 on disk -> float32
+        if self.augment:
+            if np.random.rand() < FLIP_PROB:
+                img = augment_flip_lr(img)
+            img = augment_time_shift(img, self.max_shift)
+        img = image_to_layout(normalize_image(img), self.layout)
+        return (torch.from_numpy(np.ascontiguousarray(img)),
+                torch.from_numpy(self.targets[i]),
+                torch.tensor(self.weights[i]))
+
+    def __getstate__(self):
+        """Used when DataLoader workers are started with 'spawn' (Windows): pickling a memory-mapped cache would copy
+        the whole multi-GB array into every worker. Keep only the file name and re-open it in the worker."""
+        state = self.__dict__.copy()
+        if isinstance(self.images, np.memmap):
+            state["_images_path"] = self.images.filename
+            state["_images_shape"] = self.images.shape
+            state["images"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        if self.images is None:
+            self.images = np.load(self._images_path, mmap_mode="r")
 
 
 def make_loader(dataset, args, shuffle):
-    """[easy] DataLoader(batch_size, shuffle, num_workers, pin_memory, drop_last for training)."""
-    raise NotImplementedError
+    """DataLoader for training (shuffle=True: shuffled, last incomplete batch dropped) or evaluation (in order).
+    A seeded generator makes the shuffle order and the worker seeds reproducible."""
+    generator = None
+    if shuffle:
+        generator = torch.Generator()
+        generator.manual_seed(args.seed)
+    return DataLoader(dataset, batch_size=args.batch_size, shuffle=shuffle, num_workers=args.num_workers,
+                      pin_memory=torch.cuda.is_available(), drop_last=shuffle, generator=generator,
+                      persistent_workers=args.num_workers > 0)
+
 
 
 # (4): THE MODEL
