@@ -23,6 +23,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import random
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
@@ -105,18 +106,23 @@ def get_args(): # This function is partially copied from the first_attempt_file,
     return args
 
 def set_seed(seed):
-    """[easy] Seed python, numpy and torch (incl. cuda) for reproducible runs."""
-    raise NotImplementedError
+    """ Seed python, numpy and torch (incl. cuda) for reproducible runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)      # does nothing (and does not fail) without a GPU
 
 
 def get_device():
-    """[easy] cuda if available, else cpu (print which one)."""
-    raise NotImplementedError
-
+    """cuda if available, else cpu (print which one)."""
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
+    print(f"Using device: {device} ({name})")
+    return device
 
 # (1): PREPROCESSING 1 -- labels, vote information, folds
 def load_data(args):
-    """[easy] df = fa.load_labels(...): one row per EEG with Y (6 vote fractions), num_votes, vote_weight,
+    """df = fa.load_labels(...): one row per EEG with Y (6 vote fractions), num_votes, vote_weight,
     eeg_mid, spec_off_min/max, patient_id. --smoke: keep only ~2000 EEGs."""
     raise NotImplementedError
 
