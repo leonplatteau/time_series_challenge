@@ -47,7 +47,7 @@ BIPOLAR_CHAINS = {
 HGB_KL_ALL, HGB_KL_HI = 0.8612, 0.8128
 
 
-def get_args():
+def get_args(): # This function is partially copied from the first_attempt_file, the other part, i wrote by myself. The fully AI-generated lines are annotated.
     """Command-line switches (same philosophy as the first attempt: ablations without code changes).
 
     --data-dir, --cache-dir, --output, --seed, --n-jobs
@@ -62,41 +62,47 @@ def get_args():
     parser = argparse.ArgumentParser(description="HMS second attempt")
     parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent,
                         help="folder with train.csv, test.csv, train_eegs/, test_eegs/, train_spectrograms/, test_spectrograms/")
-    parser.add_argument("--cache-dir", type=Path, default=Path("feature_cache"))    
-    parser.add_argument("--mode", choices=["full", "quick"], default="full",
-                        help="full: all training EEGs; quick: EEGs of a random 3,000 spectrograms")
-    parser.add_argument("--mode", choices=["channels", "stacked"], default="channels",
+    parser.add_argument("--cache-dir", type=Path, default=Path("image_cache"),
+                        help="cached image arrays, out-of-fold predictions and fold checkpoints")    
+    parser.add_argument("--image-layout", choices=["channels", "stacked"], default="channels",
                             help="chains as input channels, or chains stacked vertically into one image")
     parser.add_argument("--montage", action=argparse.BooleanOptionalAction, default=True,
-                            help="Double bnanan on/off (default on)")
-    parser.add_argument("--band-low", action=argparse.BooleanOptionalAction, default=False,
-                            help=" 20 Hz as bandpass upper boundary on the raw EEG (default off)")
-    parser.add_argument("--band-high", action=argparse.BooleanOptionalAction, default=High,
-                                help=" 40 Hz as bandpass upper boundary on the raw EEG (default on)")
-    parser.add_argument("--weights-path", type=Path, default=Path("Weights"),
-                        help="Folder with weights")
+                            help="Double banana on/off (default on)")
+    parser.add_argument("--band-low", type=float, default=0.5,
+                            help=" Lower boundary for bandpassfilter")
+    parser.add_argument("--band-high", type=float, default=40,
+                                help=" Upper boundary for bandpassfilter")
+    parser.add_argument("--weights-path", type=Path, default=None,
+                        help="optional local file with pretrained weights (for notebooks without internet)")
+    parser.add_argument("--backbone", type=str, default="efficientnet_b0",
+                        help="name of a timm model, e.g. efficientnet_b0, efficientnet_b2, resnet34") #AI-generated line
     parser.add_argument("--pretrained", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--stage2-min-votes", type=int, default=10, help="drop training EEGs with fewer votes (0 = keep all)")
+    parser.add_argument("--stage2-min-votes", type=int, default=10, help="stage 2 fine-tunes only on EEGs with at least this many votes")
     parser.add_argument("--vote-cap", type=int, default=10, help="number of votes from which a sample gets full weight")
     parser.add_argument("--cv-only", action="store_true",
-                        help="stop after cross-validation (no final model, no submission)")
+                        help="stop after cross-validation (no test predictions, no submission)")
     parser.add_argument("--folds", type=int, default=5)
-    parser.add_argument("--only-fold K", action=argparse.BooleanOptionalAction, default=False, help: "run one fold")
+    parser.add_argument("--only-fold", type=int, default=None, help= "run one fold")
     parser.add_argument("--smoke", action=argparse.BooleanOptionalAction, default = False, help="tiny run to test the pipeline")
     parser.add_argument("--representation", choices=["official", "eeg"], default = "official", help = "official = Kaggle spectrograms, eeg = own spectrograms from the EEG" )
     parser.add_argument("--n-jobs", type=int, default=-1, help="CPU cores for reading files (-1 = all)")
+    parser.add_argument("--num-workers", type=int, default=2,
+                        help="DataLoader worker processes (use 0 if Windows gives trouble)") #AI-generated line
     parser.add_argument("--no-cache", action="store_true")
-    parser.add_argument("--epochs1", type=int, default=1)
-    parser.add_argument("--epochs2", type=int, default=1)
-    parser.add_argument("--lr1", type=int, default=1)
-    parser.add_argument("--lr2", type=int, default=1)
-    parser.add_argument("amp", action=argparse.BooleanOptionalAction, default = True)
-    parser.add_argument("--batch-size", type=int, default=0)
+    parser.add_argument("--epochs1", type=int, default=10)
+    parser.add_argument("--epochs2", type=int, default=3)
+    parser.add_argument("--lr1", type=float, default=1e-3)
+    parser.add_argument("--lr2", type=float, default=1e-4)
+    parser.add_argument("--amp", action=argparse.BooleanOptionalAction, default = True)
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
-    parser.add_argument("--model-out", type=Path, default=Path("hms_first_attempt_model.joblib"))
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
-
+    if args.smoke:                      # one fold, one epoch per stage, AI-generated if-statement
+        args.epochs1 = args.epochs2 = 1
+        if args.only_fold is None:
+            args.only_fold = 0
+    return args
 
 def set_seed(seed):
     """[easy] Seed python, numpy and torch (incl. cuda) for reproducible runs."""
