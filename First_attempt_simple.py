@@ -383,6 +383,8 @@ def main():
     parser.add_argument("--vote-cap", type=int, default=10, help="number of votes from which a sample gets full weight")
     parser.add_argument("--ablation", action="store_true",
                         help="compare 4 vote-handling variants in CV (final model still uses the flags above)")
+    parser.add_argument("--cv-only", action="store_true",
+                        help="stop after cross-validation (no final model, no submission)")
     parser.add_argument("--folds", type=int, default=5)
     parser.add_argument("--n-jobs", type=int, default=-1, help="CPU cores for reading files (-1 = all)")
     parser.add_argument("--cache-dir", type=Path, default=Path("feature_cache"))
@@ -417,6 +419,8 @@ def main():
         variants = {f"config (weight={args.weight_votes}, min={args.min_votes})":
                     (args.weight_votes, args.min_votes)}
     cross_validate(X, Y, df["patient_id"].to_numpy(), num_votes, vote_weight, variants, args.folds, args.seed)
+    if args.cv_only:
+        return
 
     # (6) final model on all training data (vote handling as set by the flags)
     keep = num_votes >= args.min_votes
