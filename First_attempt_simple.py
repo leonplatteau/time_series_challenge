@@ -188,7 +188,7 @@ def band_columns(columns): #same as hms_sklearn_baseline
     """Return {(region, band): [column indices]} for the 400 spectrogram columns like 'LL_1.17'."""
     out = {}
     for r in REGIONS:
-        for b, (lo, hi) in BANDS.items():
+        for b, (lo, hi) in EEG_BANDS.items():
             out[(r, b)] = [i for i, c in enumerate(columns)
                            if c.startswith(r + "_") and lo <= float(c.split("_")[1]) < hi]
     return out
@@ -231,7 +231,7 @@ def spectrogram_features(path, windows, is_test): #identical to hms_sklearn_base
             # Training spectrograms cover the whole recording. Start at the midpoint of the labelled
             # offsets; offsets are in seconds and rows are 2 s apart, hence the division by 4 (= /2 /2).
             start = int((off_min + off_max) // 4)
-        feats = window_features(spec[start:start + 300], cols)
+        feats = spec_window_features(spec[start:start + 300], cols)
         feats["eeg_id"] = eeg_id
         rows.append(feats)
     return rows
