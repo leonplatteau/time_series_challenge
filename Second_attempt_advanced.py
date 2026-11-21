@@ -32,7 +32,9 @@ import timm   # pretrained backbones. Kaggle: weights need internet (training no
 
 import First_attempt_simple as fa   # reuse: load_labels, kl_score, clean_channels, CLASSES, EEG_CHANNELS
                                     # (same labels + same folds => directly comparable with the HGB results)
-
+import os
+from joblib import Parallel, delayed
+from scipy.signal import butter, sosfiltfilt, spectrogram
 CLASSES = fa.CLASSES
 FS = 200                            # EEG sampling frequency (Hz)
 
@@ -47,6 +49,15 @@ BIPOLAR_CHAINS = {
 # Reference numbers from the first attempt (CV KL all / >=10 votes), printed next to the CNN result.
 HGB_KL_ALL, HGB_KL_HI = 0.8612, 0.8128
 
+#Relevant constants for PREPROCESSING 2, mainly for STFT
+CHAIN_ORDER = list(BIPOLAR_CHAINS)            # ["LL", "LP", "RP", "RL"]: the order of the image channels
+OFFICIAL_ROWS = 300                           # 10 minutes of the official spectrogram (rows are 2 s apart)
+OFFICIAL_FREQS = 100                          # 0.59 ... 19.92 Hz per chain
+STFT_NPERSEG = 128                            # own spectrograms: window (samples) ...
+STFT_HOP_FRAC = 0.3                           # ... hop as a fraction of the window ...
+STFT_NFFT = 1024                              # ... zero-padded FFT: bin width 200/1024 Hz, same grid as the official ones
+FREQ_BINS = slice(3, 103)                     # FFT bins 3..102 = 0.59 ... 19.92 Hz: the same 100 frequencies as the official
+LOG_MIN, LOG_MAX = -4.0, 8.0                  # power is clipped to [e^-4, e^8] before the log: keeps peaks, removes extremes
 
 def get_args(): # This function is partially copied from the first_attempt_file, the other part, i wrote by myself. The fully AI-generated lines are annotated.
     """Command-line switches (same philosophy as the first attempt: ablations without code changes).
@@ -150,51 +161,173 @@ def make_folds(df, n_folds):
 
 
 # (2): PREPROCESSING 2 -- from raw files to model-ready images (computed ONCE, then cached)
+def _read_spectrogram_file(path):
+    """Official spectrogram parquet -> (array (time, 400), list of column names), without the 'time' column."""
+    spec = pd.read_parquet(path)
+    return spec.iloc[:, 1:].to_numpy(dtype=np.float32), list(spec.columns[1:])
+
+
+def _official_window(arr, cols, offset_s, is_test):
+    """Cut the 10-minute window out of a spectrogram array and turn it into a (4, 100, 300) log image."""
+    if is_test:
+        start = max(0, (len(arr) - OFFICIAL_ROWS) // 2)          # test spectrograms: take the middle 10 minutes
+    else:
+        start = int(offset_s // 2)                                # offset in seconds, rows are 2 s apart
+    start = min(max(start, 0), max(len(arr) - OFFICIAL_ROWS, 0))
+    win = arr[start:start + OFFICIAL_ROWS]
+    if len(win) < OFFICIAL_ROWS:                                  # unexpectedly short file: pad with NaN
+        win = np.pad(win, ((0, OFFICIAL_ROWS - len(win)), (0, 0)), constant_values=np.nan)
+    chains = []
+    for chain in CHAIN_ORDER:
+        idx = sorted((i for i, c in enumerate(cols) if c.startswith(chain + "_")),
+                     key=lambda i: float(cols[i].split("_")[1]))   # by frequency
+        chains.append(win[:, idx].T)                               # (frequency, time)
+    img = np.nan_to_num(np.stack(chains), nan=0.0)                 # NaN -> 0 power -> floor value after clipping
+    return np.log(np.clip(img, np.exp(LOG_MIN), np.exp(LOG_MAX))).astype(np.float32)
+
+
 def load_official_spectrogram(path, offset_s, is_test):
-    """[medium] Read train/test spectrogram parquet -> array (4 chains, 100 freqs, 300 time steps).
-    Pseudocode:
-        spec = read parquet, drop 'time' column -> (time, 400)
-        window start: train = offset_s / 2 (rows are 2 s apart), test = middle 300 rows
-        split the 400 columns by prefix LL / LP / RP / RL (this order!) -> (4, 100, 300)
-        log1p + clip (keep peaks, do not over-normalise), NaN -> 0
+    """Official Kaggle spectrogram -> array (4 chains, 100 frequencies, 300 time steps), chain order LL, LP, RP, RL.
+
+    offset_s: train = midpoint of spectrogram_label_offset_seconds; ignored for test.
+    Power is clipped to [e^-4, e^8] and log-transformed (keeps the peaks, removes extremes); NaN -> floor value.
     """
-    raise NotImplementedError
+    arr, cols = _read_spectrogram_file(path)
+    return _official_window(arr, cols, offset_s, is_test)
 
 
 def load_eeg_50s(path, mid_offset):
-    """[easy] 50 s segment (10000 x 19) starting at mid_offset (train) or 0 (test); NaN fill + clip.
-    Can reuse fa.load_eeg_window(..., window_seconds=50, use_filter=False)."""
-    raise NotImplementedError
+    """50 s EEG segment (10000 x 19, channel order fa.EEG_CHANNELS), NaN interpolated and clipped.
+    mid_offset: start (s) of the segment in the file (train: eeg_mid; test: 0)."""
+    return fa.load_eeg_window(path, mid_offset, window_seconds=fa.SEGMENT_SECONDS, use_filter=False)
 
 
 def filter_eeg(x, low, high):
-    """[easy] Zero-phase Butterworth bandpass along time (see fa.bandpass), edges as arguments.
-    DECISION to test: 0.5-40 Hz (first attempt) vs 0.5-20 Hz."""
-    raise NotImplementedError
+    """Zero-phase 4th-order Butterworth bandpass along time (axis 0) of x (time, channels); edges in Hz."""
+    assert 0 < low < high < fa.FS / 2, f"invalid bandpass edges: {low}-{high} Hz"
+    sos = butter(4, [low, high], btype="bandpass", fs=fa.FS, output="sos")
+    return sosfiltfilt(sos, x, axis=0)
 
 
 def bipolar_montage(x, channel_names):
-    """[medium] Double banana: (10000, 19) -> (16, 10000) as differences x[anode] - x[cathode],
-    channel order = LL, LP, RP, RL (4 pairs each). Do this AFTER NaN fill, BEFORE/AFTER filtering (equivalent)."""
-    raise NotImplementedError
+    """Double banana: x (time, 19) -> (16, time) as anode minus cathode, order = chains LL, LP, RP, RL (4 pairs each)."""
+    idx = {name: i for i, name in enumerate(channel_names)}
+    pairs = [pair for chain in CHAIN_ORDER for pair in BIPOLAR_CHAINS[chain]]
+    return np.stack([x[:, idx[a]] - x[:, idx[b]] for a, b in pairs])
 
 
-def eeg_to_spectrogram(x16, args):
-    """[hard] Own spectrograms from the montaged EEG, one per channel or per chain (mean of 4 pairs).
-    Pseudocode:
-        STFT per channel (scipy.signal.stft / spectrogram), frequency range 0-20 Hz
-        log-transform, clip, optional per-sample normalisation
-        output (C, F, T') with C = 4 chains (mean over the 4 pairs) or 16 channels
-    DECISION: window/hop sizes -> start from a literature value, tune later."""
-    raise NotImplementedError
+def referential_chains(x, channel_names):
+    """Control for --no-montage: the same chains, but the plain electrodes (no subtraction).
+    x (time, 19) -> (20, time): 5 electrodes per chain (the 4 pairs share electrodes), order LL, LP, RP, RL."""
+    idx = {name: i for i, name in enumerate(channel_names)}
+    electrodes = []
+    for chain in CHAIN_ORDER:
+        pairs = BIPOLAR_CHAINS[chain]
+        electrodes += [pairs[0][0]] + [cathode for _, cathode in pairs]
+    return np.stack([x[:, idx[e]] for e in electrodes])
+
+
+def eeg_to_spectrogram(signals):
+    """Own spectrograms: signals (n, time) with n divisible by 4 (consecutive blocks = the 4 chains)
+    -> (4 chains, 100 frequencies, time steps), same log transform and frequency grid as the official ones.
+
+    STFT with a 128-sample window, hop of 30% and FFT length 1024 (a literature setting; tune later), 0.59-19.92 Hz.
+    Power is averaged over the channels of each chain BEFORE the log, as in the official spectrograms.
+    """
+    hop = int(STFT_NPERSEG * STFT_HOP_FRAC)
+    _, _, sxx = spectrogram(signals, fs=fa.FS, window="hann", nperseg=STFT_NPERSEG,
+                            noverlap=STFT_NPERSEG - hop, nfft=STFT_NFFT, scaling="density", mode="psd", axis=-1)
+    sxx = sxx[:, FREQ_BINS, :]                                              # (n, 100, time steps)
+    per_chain = sxx.shape[0] // len(CHAIN_ORDER)
+    sxx = sxx.reshape(len(CHAIN_ORDER), per_chain, *sxx.shape[1:]).mean(axis=1)
+    return np.log(np.clip(sxx, np.exp(LOG_MIN), np.exp(LOG_MAX))).astype(np.float32)
+
+
+def _official_job(path, items, is_test):
+    """One spectrogram file, all EEGs that use it. items = [(row, offset_s)]. Returns [(row, image or None)]."""
+    try:
+        arr, cols = _read_spectrogram_file(path)
+        return [(row, _official_window(arr, cols, off, is_test).astype(np.float16)) for row, off in items]
+    except Exception as err:
+        print(f"warning: spectrogram {Path(path).name} failed ({type(err).__name__}: {err})")
+        return [(row, None) for row, _ in items]
+
+
+def _eeg_job(row, path, mid_offset, montage, band_low, band_high):
+    """One EEG file -> [(row, image or None)]: load, bandpass, (double banana), STFT."""
+    try:
+        x = filter_eeg(load_eeg_50s(path, mid_offset), band_low, band_high)
+        signals = bipolar_montage(x, fa.EEG_CHANNELS) if montage else referential_chains(x, fa.EEG_CHANNELS)
+        return [(row, eeg_to_spectrogram(signals).astype(np.float16))]
+    except Exception as err:
+        print(f"warning: EEG {Path(path).name} failed ({type(err).__name__}: {err})")
+        return [(row, None)]
 
 
 def build_image_cache(df, data_dir, args, is_test=False):
-    """[medium] Compute the image of every EEG once and store them in ONE array on disk (np.save / memmap),
-    shape (N, C, H, W) float16, plus an eeg_id -> row index. Parallel with joblib (like the first attempt).
-    Cache key includes representation, montage, band, layout (so ablations do not overwrite each other).
-    Returns (images, index)."""
-    raise NotImplementedError
+    """Compute the image of every EEG once and store all of them in ONE float16 array (N, 4, 100, time).
+
+    Returns (images, index) with index = {eeg_id: row in images}. The array is written to
+    cache_dir/images_<split>_<representation>_n<N>_s<seed>.npy (via a temporary file, so an interrupted run never
+    leaves a broken cache); with --no-cache it only lives in memory. Failed files stay all-zero and are counted.
+    The cache does not depend on --image-layout: stacking the chains is done later, in the Dataset.
+    """
+    t0 = time.time()
+    split = "test" if is_test else "train"
+    if args.representation == "official":
+        tag = "official"
+        img_shape = (len(CHAIN_ORDER), OFFICIAL_FREQS, OFFICIAL_ROWS)
+    else:
+        tag = f"eeg_montage{int(args.montage)}_band{args.band_low:g}-{args.band_high:g}"
+        probe = eeg_to_spectrogram(np.zeros((16, fa.SEGMENT_SECONDS * fa.FS)))      # only to learn the shape
+        img_shape = probe.shape
+    index = {int(e): row for row, e in enumerate(df["eeg_id"])}
+    use_cache = not args.no_cache
+    cache_path = args.cache_dir / f"images_{split}_{tag}_n{len(df)}_s{args.seed}.npy"
+
+    if use_cache and cache_path.exists():
+        print(f"loaded cached images: {cache_path}")
+        return np.load(cache_path, mmap_mode="r"), index
+
+    shape = (len(df),) + img_shape
+    if use_cache:
+        args.cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+        out = np.lib.format.open_memmap(tmp_path, mode="w+", dtype=np.float16, shape=shape)   # starts as zeros
+    else:
+        out = np.zeros(shape, dtype=np.float16)
+
+    rows = np.arange(len(df))
+    if args.representation == "official":
+        offsets = np.zeros(len(df)) if is_test else ((df["spec_off_min"] + df["spec_off_max"]) / 2).to_numpy()
+        jobs = [delayed(_official_job)(data_dir / f"{split}_spectrograms" / f"{sid}.parquet",
+                                       list(zip(rows[mask], offsets[mask])), is_test)
+                for sid, mask in ((s, (df["spectrogram_id"] == s).to_numpy()) for s in df["spectrogram_id"].unique())]
+    else:
+        mids = np.zeros(len(df)) if is_test else df["eeg_mid"].to_numpy()
+        jobs = [delayed(_eeg_job)(row, data_dir / f"{split}_eegs" / f"{eeg_id}.parquet", mids[row],
+                                  args.montage, args.band_low, args.band_high)
+                for row, eeg_id in zip(rows, df["eeg_id"])]
+
+    n_fail = 0
+    for results in Parallel(n_jobs=args.n_jobs, batch_size=32, return_as="generator")(jobs):   # results arrive in order
+        for row, img in results:
+            if img is None:
+                n_fail += 1
+            else:
+                out[row] = img
+    if n_fail == len(df):
+        raise RuntimeError(f"No image could be computed ({tag}); check the folders and file names")
+    if n_fail:
+        print(f"warning: {n_fail} of {len(df)} images failed and are all-zero")
+
+    if use_cache:
+        out.flush()
+        del out
+        os.replace(tmp_path, cache_path)
+        out = np.load(cache_path, mmap_mode="r")
+    print(f"Images ({tag}, {split}): {shape} in {time.time() - t0:.0f}s")
+    return out, index
 
 
 # (3): REPRESENTATION -- dataset, augmentation, loaders
