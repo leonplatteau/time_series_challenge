@@ -120,17 +120,33 @@ def get_device():
     print(f"Using device: {device} ({name})")
     return device
 
-# (1): PREPROCESSING 1 -- labels, vote information, folds
-def load_data(args):
-    """df = fa.load_labels(...): one row per EEG with Y (6 vote fractions), num_votes, vote_weight,
-    eeg_mid, spec_off_min/max, patient_id. --smoke: keep only ~2000 EEGs."""
-    raise NotImplementedError
+# (1): PREPROCESSING 1 -- labels, vote information, folds #AI-generated functions
+def load_data(args): 
+    """One row per EEG with its vote distribution, vote information and offsets (reuses the first attempt).
+
+    Columns (from fa.load_labels): eeg_id, spectrogram_id, patient_id, eeg_off_min/max, spec_off_min/max,
+    n_segments, the 6 vote fractions (CLASSES), num_votes, vote_weight, eeg_mid.
+    --smoke: keep a random subset of 2000 EEGs, enough to test the whole pipeline quickly.
+    """
+    df = fa.load_labels(args.data_dir, vote_cap=args.vote_cap, seed=args.seed)
+    if args.smoke:
+        df = df.sample(n=min(2000, len(df)), random_state=args.seed).reset_index(drop=True)
+    print(df.shape, "EEGs from", df.patient_id.nunique(), "patients,", df.spectrogram_id.nunique(), "spectrograms")
+    return df
 
 
 def make_folds(df, n_folds):
-    """[easy] list of (train_idx, val_idx) from GroupKFold(patient_id), same call as in the first attempt
-    (identical folds => paired comparison with the HGB per fold)."""
-    raise NotImplementedError
+    """List of (train_idx, val_idx) from GroupKFold on patient_id.
+
+    Same splitter as in the first attempt: in full mode the folds are identical, so CNN and HGB can be compared
+    per fold. A patient never appears in both the training and the validation part of a fold.
+    """
+    folds = list(GroupKFold(n_splits=n_folds).split(df, groups=df["patient_id"].to_numpy()))
+    for k, (tr, va) in enumerate(folds):
+        overlap = set(df["patient_id"].iloc[tr]) & set(df["patient_id"].iloc[va])
+        assert not overlap, f"fold {k}: patients in both train and validation: {sorted(overlap)[:5]}"
+        print(f"fold {k}: {len(tr)} train / {len(va)} validation EEGs")
+    return folds
 
 
 # (2): PREPROCESSING 2 -- from raw files to model-ready images (computed ONCE, then cached)
