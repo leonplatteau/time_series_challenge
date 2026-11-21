@@ -280,5 +280,159 @@ def build_features(meta, data_dir, args, is_test=False): #cfr hms_sklearn_baseli
         out = out.merge(spec, on="eeg_id", how="left")
     return out
 
+# (4) THE MODEL (almost completely identical to hms_sklearn_baseline)
+def kl_score(y_true, y_pred, eps=1e-15):
+    """Mean KL divergence KL(y_true || y_pred) over samples, as in the competition metric."""
+    p = np.clip(y_pred, eps, 1)
+    p = p / p.sum(axis=1, keepdims=True)
+    t = y_true
+    return np.mean(np.sum(np.where(t > 0, t * np.log(np.where(t > 0, t, 1) / p), 0), axis=1))
 
 
+def expand(X, Y, sample_weight=None):
+    """Turn soft labels into weighted hard labels.
+
+    Each sample is repeated once per class (label = class index, weight = vote fraction). An optional
+    per-sample weight (the vote reliability weight) multiplies the vote fractions. Zero-weight copies are dropped.
+    """
+    n, k = Y.shape
+    Xr = np.repeat(X, k, axis=0)
+    yr = np.tile(np.arange(k), n)
+    wr = Y.reshape(-1).copy()
+    if sample_weight is not None:
+        wr = wr * np.repeat(sample_weight, k)
+    keep = wr > 0
+    return Xr[keep], yr[keep], wr[keep]
+
+
+def make_model(seed=42):
+    """Same hyperparameters as the baseline's gradient boosting model."""
+    return HistGradientBoostingClassifier(learning_rate=0.05, max_iter=300, max_leaf_nodes=31,
+                                          l2_regularization=1.0, random_state=seed)
+
+
+def fit(X, Y, sample_weight=None, seed=42): #slightly different to hms_sklearn_baseline: sample_weight is now an input to the function
+    """Fit on features X and soft labels Y (rows are vote distributions)."""
+    Xe, ye, we = expand(X, Y, sample_weight)
+    model = make_model(seed)
+    model.fit(Xe, ye, sample_weight=we)
+    return model
+
+
+def predict_probs(model, X, n_classes=6): #This one is not in hms_sklearn_baseline, code is AI-generated
+    """Probabilities for all six classes (even if one was absent in training), clipped and normalised."""
+    p = np.zeros((len(X), n_classes))
+    p[:, model.classes_.astype(int)] = model.predict_proba(X)
+    p = np.clip(p, 1e-8, None)
+    return p / p.sum(axis=1, keepdims=True)
+
+
+def to_matrix(frame, feats):
+    """Feature table -> float32 array with missing / infinite values replaced by 0."""
+    return np.nan_to_num(frame[feats].to_numpy(dtype=np.float32), nan=0.0, posinf=0.0, neginf=0.0)
+
+
+# (5) CROSS VALIDATION
+
+def cross_validate(X, Y, groups, num_votes, vote_weight, variants, n_folds, seed): #similar to hms_sklearn_baseline, some AI-generated modifications
+    """Patient-grouped K-fold CV for each vote-handling variant.
+
+    variants: {name: (weight_by_votes, min_votes)}. The vote handling only affects the TRAINING part of
+    each fold; validation always uses all EEGs and the plain (unweighted) KL, so variants stay comparable.
+    All variants use exactly the same folds.
+    """
+    prior = np.tile(Y.mean(axis=0), (len(Y), 1))     # trivial reference: always the mean distribution
+    hi = num_votes >= 10                             # EEGs with at least 10 expert votes
+    folds = list(GroupKFold(n_splits=n_folds).split(X, Y, groups))
+    results = {}
+    for name, (weight_by_votes, min_votes) in variants.items():
+        t0 = time.time()
+        oof = np.zeros_like(Y)                       # out-of-fold predictions
+        for fold, (tr, va) in enumerate(folds):
+            tr = tr[num_votes[tr] >= min_votes]
+            w = vote_weight[tr] if weight_by_votes else None
+            oof[va] = predict_probs(fit(X[tr], Y[tr], w, seed), X[va])
+            print(f"  [{name}] fold {fold}: KL={kl_score(Y[va], oof[va]):.4f}")
+        results[name] = (kl_score(Y, oof), kl_score(Y[hi], oof[hi]))
+        print(f"  [{name}] done in {time.time() - t0:.0f}s")
+
+    print(f"\n{'variant':<28}{'KL all':>10}{'KL >=10 votes':>16}")
+    print(f"{'prior (mean distribution)':<28}{kl_score(Y, prior):>10.4f}{kl_score(Y[hi], prior[hi]):>16.4f}")
+    print(f"{'baseline (earlier run)':<28}{BASELINE_KL_ALL:>10.4f}{BASELINE_KL_HI:>16.4f}")
+    for name, (kl_all, kl_hi) in results.items():
+        print(f"{name:<28}{kl_all:>10.4f}{kl_hi:>16.4f}")
+    return results
+
+
+# (6): MAIN -- features, cross-validation, final model, submission, AI-generated code
+def main():
+    parser = argparse.ArgumentParser(description="HMS first own attempt: filtered EEG features + HGB")
+    parser.add_argument("--data-dir", type=Path, default=Path(__file__).resolve().parent,
+                        help="folder with train.csv, test.csv, train_eegs/, test_eegs/, train_spectrograms/, test_spectrograms/")
+    parser.add_argument("--mode", choices=["full", "quick"], default="full",
+                        help="full: all training EEGs; quick: EEGs of a random 3,000 spectrograms")
+    parser.add_argument("--filter", action=argparse.BooleanOptionalAction, default=True,
+                        help="bandpass 0.5-40 Hz on the raw EEG (default on)")
+    parser.add_argument("--spec", action=argparse.BooleanOptionalAction, default=True,
+                        help="add the baseline's spectrogram features to the EEG features (default on)")
+    parser.add_argument("--window", type=int, choices=[10, 50], default=10,
+                        help="seconds of EEG used for the features (central 10 s, or the whole 50 s segment)")
+    parser.add_argument("--weight-votes", action=argparse.BooleanOptionalAction, default=True,
+                        help="weight training samples by their number of votes (default on)")
+    parser.add_argument("--min-votes", type=int, default=0, help="drop training EEGs with fewer votes (0 = keep all)")
+    parser.add_argument("--vote-cap", type=int, default=10, help="number of votes from which a sample gets full weight")
+    parser.add_argument("--ablation", action="store_true",
+                        help="compare 4 vote-handling variants in CV (final model still uses the flags above)")
+    parser.add_argument("--folds", type=int, default=5)
+    parser.add_argument("--n-jobs", type=int, default=-1, help="CPU cores for reading files (-1 = all)")
+    parser.add_argument("--cache-dir", type=Path, default=Path("feature_cache"))
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--output", type=Path, default=Path("submission.csv"))
+    parser.add_argument("--model-out", type=Path, default=Path("hms_first_attempt_model.joblib"))
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    # (1) labels and vote information
+    df = load_labels(args.data_dir, max_specs=3000 if args.mode == "quick" else None,
+                     seed=args.seed, vote_cap=args.vote_cap)
+    print(df.shape, "EEGs from", df.patient_id.nunique(), "patients,", df.spectrogram_id.nunique(), "spectrograms")
+
+    # (2) + (3) preprocessing and features
+    X_df = build_features(df, args.data_dir, args)
+    df = df.merge(X_df, on="eeg_id", how="left")
+    feats = [c for c in X_df.columns if c != "eeg_id"]
+    print(len(feats), "features")
+    X = to_matrix(df, feats)
+    Y = df[CLASSES].to_numpy()
+    num_votes = df["num_votes"].to_numpy()
+    vote_weight = df["vote_weight"].to_numpy()
+
+    # (5) cross-validation (always on)
+    if args.ablation:
+        variants = {"no vote handling": (False, 0),
+                    "weighted by votes": (True, 0),
+                    "min 10 votes": (False, 10),
+                    "weighted + min 5 votes": (True, 5)}
+    else:
+        variants = {f"config (weight={args.weight_votes}, min={args.min_votes})":
+                    (args.weight_votes, args.min_votes)}
+    cross_validate(X, Y, df["patient_id"].to_numpy(), num_votes, vote_weight, variants, args.folds, args.seed)
+
+    # (6) final model on all training data (vote handling as set by the flags)
+    keep = num_votes >= args.min_votes
+    weights = vote_weight[keep] if args.weight_votes else None
+    final = fit(X[keep], Y[keep], weights, args.seed)
+    joblib.dump({"model": final, "features": feats, "config": vars(args)}, args.model_out)
+
+    test = pd.read_csv(args.data_dir / "test.csv")
+    T_df = build_features(test, args.data_dir, args, is_test=True)
+    T_df = test[["eeg_id"]].merge(T_df, on="eeg_id", how="left")        # keep the order of test.csv
+
+    sub = pd.DataFrame({"eeg_id": T_df["eeg_id"]})
+    sub[CLASSES] = predict_probs(final, to_matrix(T_df, feats))
+    sub.to_csv(args.output, index=False)
+    print(f"Saved {args.output} with {len(sub)} rows")
+
+
+if __name__ == "__main__":   # required for parallel workers on macOS and Windows
+    main()
