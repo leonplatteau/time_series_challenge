@@ -33,6 +33,7 @@ import timm   # pretrained backbones. Kaggle: weights need internet (training no
 import First_attempt_simple as fa   # reuse: load_labels, kl_score, clean_channels, CLASSES, EEG_CHANNELS
                                     # (same labels + same folds => directly comparable with the HGB results)
 import os
+import torch.nn.functional as F
 from joblib import Parallel, delayed
 from scipy.signal import butter, sosfiltfilt, spectrogram
 CLASSES = fa.CLASSES
@@ -440,22 +441,51 @@ def make_loader(dataset, args, shuffle):
 
 
 # (4): THE MODEL
+# (4): THE MODEL
+MODEL_INPUT_SIZE = (256, 512)   # (height, width) the images are resized to before the backbone; None = no resizing
+
+
 class HMSNet(nn.Module):
-    """[medium] timm backbone (pretrained, in_chans = number of image channels, num_classes=6) -> logits.
-    Option: replicate/resize the image to what the backbone expects (e.g. 3 channels, fixed H x W)."""
-    def __init__(self, backbone, in_chans, pretrained, weights_path=None):
+    """timm backbone (EfficientNet by default) + a new 6-class head. Input: (batch, in_chans, H, W) images from
+    HMSDataset; output: logits (batch, 6) (softmax is applied in the loss / when predicting).
+
+    backbone: name of a timm model. in_chans: 4 (channels layout) or 1 (stacked layout); timm adapts the first
+    convolution of the pretrained network to this number of channels.
+    pretrained: start from ImageNet weights. Without internet give weights_path (a weights file of that backbone,
+    e.g. downloaded from the timm page on huggingface.co and uploaded as a Kaggle dataset); the classifier head
+    is replaced by a new 6-class head anyway.
+    The images are small (100 pixels high), so they are upscaled to MODEL_INPUT_SIZE inside the model.
+    """
+
+    def __init__(self, backbone, in_chans, pretrained, weights_path=None, input_size=MODEL_INPUT_SIZE):
         super().__init__()
-        raise NotImplementedError
+        kwargs = dict(in_chans=in_chans, num_classes=len(CLASSES))
+        if pretrained and weights_path is not None:
+            kwargs["pretrained_cfg_overlay"] = dict(file=str(weights_path))      # load the weights from a local file
+        self.net = timm.create_model(backbone, pretrained=pretrained, **kwargs)
+        self.input_size = input_size
 
     def forward(self, x):
-        raise NotImplementedError
+        if self.input_size is not None and tuple(x.shape[-2:]) != tuple(self.input_size):
+            x = F.interpolate(x, size=self.input_size, mode="bilinear", align_corners=False)
+        return self.net(x)
 
 
 def kl_loss(logits, target, weight=None):
-    """[easy] KL(target || softmax(logits)) per sample, optionally weighted:
-        logp = log_softmax(logits); kl = sum(t * (log t - logp)) with t clipped away from 0
-        return (kl * weight).sum() / weight.sum()   (plain mean if weight is None)"""
-    raise NotImplementedError
+    """KL(target || softmax(logits)) per sample, then the mean over the batch; with weights, the weighted mean.
+
+    Same quantity as the competition metric (fa.kl_score). Classes without votes (target 0) contribute nothing.
+    weight: per-sample weights (e.g. vote_weight in stage 1); None = plain mean (stage 2).
+    """
+    log_p = F.log_softmax(logits.float(), dim=1)
+    t = target.float()
+    log_t = torch.log(t.clamp_min(1e-15))                    # only avoids log(0); those terms are multiplied by 0
+    kl = (t * (log_t - log_p)).sum(dim=1)                    # (batch,)
+    if weight is None:
+        return kl.mean()
+    w = weight.float()
+    return (kl * w).sum() / w.sum()
+
 
 
 # (5): TRAINING -- stage 1 (all data, vote weights) and stage 2 (fine-tune on reliable EEGs)
