@@ -354,6 +354,7 @@ def cross_validate(X, Y, groups, num_votes, vote_weight, variants, n_folds, seed
             oof[va] = predict_probs(fit(X[tr], Y[tr], w, seed), X[va])
             print(f"  [{name}] fold {fold}: KL={kl_score(Y[va], oof[va]):.4f}")
         results[name] = (kl_score(Y, oof), kl_score(Y[hi], oof[hi]))
+        np.save("oof_hgb.npy", oof)      # for the blend analysis of the second attempt
         print(f"  [{name}] done in {time.time() - t0:.0f}s")
 
     print(f"\n{'variant':<28}{'KL all':>10}{'KL >=10 votes':>16}")
