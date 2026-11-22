@@ -441,7 +441,6 @@ def make_loader(dataset, args, shuffle):
 
 
 # (4): THE MODEL
-# (4): THE MODEL
 MODEL_INPUT_SIZE = (256, 512)   # (height, width) the images are resized to before the backbone; None = no resizing
 
 
@@ -489,31 +488,119 @@ def kl_loss(logits, target, weight=None):
 
 
 # (5): TRAINING -- stage 1 (all data, vote weights) and stage 2 (fine-tune on reliable EEGs)
+def run_tag(args):
+    """Short name of this experiment (representation, backbone, layout), used in checkpoint and OOF file names so
+    different runs never overwrite each other. Smoke runs get their own suffix."""
+    if args.representation == "official":
+        rep = "official"
+    else:
+        rep = f"eeg_montage{int(args.montage)}_band{args.band_low:g}-{args.band_high:g}"
+    return f"{rep}_{args.backbone}_{args.image_layout}" + ("_smoke" if args.smoke else "")
+
+
+def _flip_batch(x):
+    """Mirror left <-> right for a batch (b, c, h, w): reverse the chains. channels layout: c = 4, flip the channel axis;
+    stacked layout: c = 1 and the 4 chains lie below each other in the height axis."""
+    if x.shape[1] == len(CHAIN_ORDER):
+        return x.flip(1)
+    b, c, h, w = x.shape
+    return x.reshape(b, c, len(CHAIN_ORDER), h // len(CHAIN_ORDER), w).flip(2).reshape(b, c, h, w)
+
+
 def train_one_epoch(model, loader, optimizer, scheduler, scaler, device, use_weights, amp):
-    """[medium] Standard loop with mixed precision (torch.autocast + GradScaler), kl_loss, grad clipping.
-    Returns the mean training loss."""
-    raise NotImplementedError
+    """One pass over the training loader: forward (mixed precision on GPU), weighted KL loss, backward with gradient
+    clipping, optimizer step, learning-rate step (the scheduler is stepped per batch). Returns the mean training loss."""
+    model.train()
+    use_amp = amp and device.type == "cuda"
+    total, count = 0.0, 0
+    for x, y, w in loader:
+        x, y, w = x.to(device, non_blocking=True), y.to(device, non_blocking=True), w.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(x)
+        loss = kl_loss(logits, y, w if use_weights else None)
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)                                   # so the clipping works on the real gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        scaler.step(optimizer)
+        scaler.update()
+        if scheduler is not None:
+            scheduler.step()
+        total += loss.item() * len(x)
+        count += len(x)
+    return total / max(count, 1)
 
 
 @torch.no_grad()
 def predict_loader(model, loader, device, amp, tta_flip=False):
-    """[easy] Softmax probabilities (n, 6) for a loader; optional TTA = average with the flipped image."""
-    raise NotImplementedError
+    """Softmax probabilities (n, 6) in loader order (use a loader with shuffle=False).
+    tta_flip: average the prediction for the image and for its left-right mirror image."""
+    model.eval()
+    use_amp = amp and device.type == "cuda"
+    out = []
+    for x, _, _ in loader:
+        x = x.to(device, non_blocking=True)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=use_amp):
+            logits = model(x)
+            logits_flipped = model(_flip_batch(x)) if tta_flip else None
+        p = torch.softmax(logits.float(), dim=1)
+        if tta_flip:
+            p = (p + torch.softmax(logits_flipped.float(), dim=1)) / 2
+        out.append(p.cpu().numpy())
+    return np.concatenate(out)
 
 
-def run_stage(model, train_loader, val_loader, epochs, lr, use_weights, device, args):
-    """[medium] One training stage: AdamW + cosine schedule, `epochs` epochs, print train loss + val KL per epoch.
-    Stage 1: lr1, all training EEGs, use_weights=True.
-    Stage 2: lr2 (lower), only EEGs with num_votes >= args.stage2_min_votes, use_weights=False.
-    DECISION: use a FIXED number of epochs and keep the last weights. Picking the best epoch on the validation
-    fold would make the reported CV slightly optimistic."""
-    raise NotImplementedError
+def run_stage(model, train_loader, val_loader, epochs, lr, use_weights, device, args, name="stage"):
+    """One training stage: AdamW + one-cycle schedule (short warm-up, then cosine decay to ~0), a FIXED number of epochs.
+    After every epoch the training loss and the validation KL are printed. The validation fold is only used for
+    reporting: the weights of the last epoch are kept, so the CV score is not tuned on the validation fold.
+    Returns a list with (train loss, validation KL) per epoch."""
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-2)
+    total_steps = max(1, epochs * len(train_loader))
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr=lr, total_steps=total_steps, pct_start=0.1)
+    scaler = torch.amp.GradScaler(device.type, enabled=args.amp and device.type == "cuda")
+    history = []
+    for epoch in range(epochs):
+        t0 = time.time()
+        train_loss = train_one_epoch(model, train_loader, optimizer, scheduler, scaler, device, use_weights, args.amp)
+        val_kl = float("nan")
+        if val_loader is not None:
+            val_kl = fa.kl_score(val_loader.dataset.targets, predict_loader(model, val_loader, device, args.amp))
+        history.append((train_loss, val_kl))
+        print(f"  [{name}] epoch {epoch + 1}/{epochs}  train loss {train_loss:.4f}  val KL {val_kl:.4f}"
+              f"  ({time.time() - t0:.0f}s)")
+    return history
 
 
 def fit_fold(fold, tr_idx, va_idx, images, index, df, args, device):
-    """[medium] Build model -> stage 1 -> stage 2 -> predict the validation fold -> save checkpoint
-    (cache_dir/model_{tag}_fold{fold}.pt, state_dict only). Returns validation probabilities (len(va_idx), 6)."""
-    raise NotImplementedError
+    """Train one fold: new model -> stage 1 (all training EEGs, vote weights) -> stage 2 (only EEGs with at least
+    args.stage2_min_votes votes, no weights, lower learning rate) -> predict the validation fold -> save the weights.
+    Returns the validation probabilities (len(va_idx), 6) in the order of va_idx."""
+    t0 = time.time()
+    set_seed(args.seed + fold)                                     # --only-fold K reproduces fold K of a full run
+    model = HMSNet(args.backbone, n_input_channels(args), args.pretrained, args.weights_path).to(device)
+
+    val_loader = make_loader(HMSDataset(images, index, df, va_idx, False, args), args, shuffle=False)
+
+    train1 = HMSDataset(images, index, df, tr_idx, True, args, use_weights=True)
+    run_stage(model, make_loader(train1, args, shuffle=True), val_loader, args.epochs1, args.lr1, True,
+              device, args, name=f"fold {fold} stage 1")
+
+    reliable = tr_idx[df["num_votes"].to_numpy()[tr_idx] >= args.stage2_min_votes]
+    if args.epochs2 > 0 and len(reliable) > 0:
+        print(f"  stage 2 uses {len(reliable)} of {len(tr_idx)} training EEGs (>= {args.stage2_min_votes} votes)")
+        train2 = HMSDataset(images, index, df, reliable, True, args, use_weights=False)
+        run_stage(model, make_loader(train2, args, shuffle=True), val_loader, args.epochs2, args.lr2, False,
+                  device, args, name=f"fold {fold} stage 2")
+
+    probs = predict_loader(model, val_loader, device, args.amp, tta_flip=args.augment)   # flip-TTA only if trained with flips
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), args.cache_dir / f"model_{run_tag(args)}_fold{fold}.pt")
+    print(f"fold {fold} done in {time.time() - t0:.0f}s, validation KL {fa.kl_score(df[CLASSES].to_numpy()[va_idx], probs):.4f}")
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    return probs
 
 
 # (6): CROSS-VALIDATION
