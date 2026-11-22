@@ -110,6 +110,14 @@ def get_args(): # This function is partially copied from the first_attempt_file,
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--output", type=Path, default=Path("submission.csv"))
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True,
+                        help="flip left/right and shift in time during training (default on)")
+    parser.add_argument("--predict-only", action="store_true",
+                        help="skip training and cross-validation; predict the test set with existing checkpoints")
+    parser.add_argument("--ckpt-dir", type=Path, default=None,
+                        help="folder with the fold checkpoints (default: --cache-dir); e.g. a Kaggle dataset")
+    parser.add_argument("--hgb-oof", type=Path, default=None,
+                        help="optional .npy with the HGB out-of-fold predictions, to report the best blend")
     args = parser.parse_args()
     if args.smoke:                      # one fold, one epoch per stage, AI-generated if-statement
         args.epochs1 = args.epochs2 = 1
@@ -604,37 +612,115 @@ def fit_fold(fold, tr_idx, va_idx, images, index, df, args, device):
 
 
 # (6): CROSS-VALIDATION
+HGB_FOLD_KL = [0.8525, 0.8698, 0.8152, 0.8538, 0.9150]   # first attempt (local full run), same 5 folds: paired comparison
+
+
 def cross_validate_cnn(df, images, index, args, device):
-    """[medium] Loop over the folds (or --only-fold), collect out-of-fold probabilities, save them to
-    cache_dir/oof_{tag}.npy, print per-fold KL and the table:
-        prior | HGB (first attempt) | CNN        for KL all and KL >=10 votes (fa.kl_score)
-    Returns the OOF array."""
-    raise NotImplementedError
+    """Train and validate every fold (or only --only-fold), collect the out-of-fold probabilities and report.
+
+    Prints the KL per fold (next to the HGB of the first attempt on the same fold) and a table with KL on all EEGs and
+    on EEGs with >= 10 votes for: prior | HGB (first attempt) | CNN. Saves the out-of-fold predictions to
+    cache_dir/oof_<run_tag>.npy (rows in the order of df; NaN for folds that were not run). Returns the array.
+    """
+    folds = make_folds(df, args.folds)
+    Y = df[CLASSES].to_numpy()
+    compare = (not args.smoke) and args.folds == len(HGB_FOLD_KL)       # HGB per-fold numbers exist for the full 5-fold run
+    oof = np.full(Y.shape, np.nan)
+    for k in (range(len(folds)) if args.only_fold is None else [args.only_fold]):
+        tr, va = folds[k]
+        oof[va] = fit_fold(k, tr, va, images, index, df, args, device)
+        print(f"fold {k}: CNN KL {fa.kl_score(Y[va], oof[va]):.4f}" + (f" | HGB {HGB_FOLD_KL[k]:.4f}" if compare else ""))
+
+    done = ~np.isnan(oof[:, 0])                                          # rows that belong to a validated fold
+    hi = (df["num_votes"].to_numpy() >= 10) & done
+    prior = np.tile(Y.mean(axis=0), (len(Y), 1))                         # trivial reference: the mean distribution
+
+    def report(name, probs):
+        kl_hi = fa.kl_score(Y[hi], probs[hi]) if hi.any() else float("nan")
+        print(f"{name:<46}{fa.kl_score(Y[done], probs[done]):>10.4f}{kl_hi:>16.4f}")
+
+    print(f"\n{'variant':<46}{'KL all':>10}{'KL >=10 votes':>16}")
+    report("prior (mean distribution)", prior)
+    if compare and done.all():
+        print(f"{'HGB (first attempt)':<46}{HGB_KL_ALL:>10.4f}{HGB_KL_HI:>16.4f}")
+    report(f"CNN ({run_tag(args)})", oof)
+
+    args.cache_dir.mkdir(parents=True, exist_ok=True)
+    np.save(args.cache_dir / f"oof_{run_tag(args)}.npy", oof)
+    return oof
 
 
 def blend_oof(oof_cnn, oof_hgb, y, hi_mask):
-    """[easy] Find the blend weight w in [0, 1] for  w*cnn + (1-w)*hgb  that minimises KL on the OOF predictions.
-    NOTE: the first attempt does not save its OOF predictions yet (small addition needed there)."""
-    raise NotImplementedError
+    """Best blend weight w in [0, 1] for  w * CNN + (1 - w) * HGB, searched on the out-of-fold predictions (steps of 0.05).
+    Returns (w, KL all, KL >= 10 votes) of the blend. One weight tuned on ~17,000 EEGs: negligible optimism.
+    The HGB out-of-fold predictions come from the first attempt (np.save of its `oof`), same row order."""
+    weights = np.linspace(0, 1, 21)
+    kls = [fa.kl_score(y, w * oof_cnn + (1 - w) * oof_hgb) for w in weights]
+    w = float(weights[int(np.argmin(kls))])
+    blend = w * oof_cnn + (1 - w) * oof_hgb
+    return w, fa.kl_score(y, blend), fa.kl_score(y[hi_mask], blend[hi_mask])
 
 
 # (7): INFERENCE AND SUBMISSION
 def predict_test(test, images_test, index_test, args, device):
-    """[medium] Load every fold checkpoint (pretrained=False, then load_state_dict), predict the test images
-    (optional flip-TTA), average the folds' probabilities, clip + renormalise. Returns (n_test, 6)."""
-    raise NotImplementedError
+    """Average the predictions of all fold models for the test images (flip-TTA if --augment). The checkpoints are
+    searched in --ckpt-dir (a Kaggle dataset with the trained weights) or, without it, in --cache-dir. The models are
+    built with pretrained=False: the weights come from the checkpoints, so no internet is needed.
+    Returns (n_test, 6) probabilities, clipped away from 0 and normalised."""
+    ckpt_dir = args.ckpt_dir if args.ckpt_dir is not None else args.cache_dir
+    paths = sorted(Path(ckpt_dir).glob(f"model_{run_tag(args)}_fold*.pt"))
+    if not paths:
+        raise FileNotFoundError(f"No checkpoints model_{run_tag(args)}_fold*.pt in {ckpt_dir}")
+    if len(paths) < args.folds:
+        print(f"warning: only {len(paths)} of {args.folds} fold models found")
+    print(f"predicting {len(test)} test EEGs with {len(paths)} fold model(s)")
+
+    loader = make_loader(HMSDataset(images_test, index_test, test, np.arange(len(test)), False, args), args, shuffle=False)
+    all_probs = []
+    for path in paths:
+        model = HMSNet(args.backbone, n_input_channels(args), False, None).to(device)
+        model.load_state_dict(torch.load(path, map_location=device, weights_only=True))
+        all_probs.append(predict_loader(model, loader, device, args.amp, tta_flip=args.augment))
+    probs = np.clip(np.mean(all_probs, axis=0), 1e-8, None)
+    return probs / probs.sum(axis=1, keepdims=True)
 
 
 def write_submission(test, probs, path):
-    """[easy] DataFrame(eeg_id + 6 class columns), rows in the order of test.csv, each row sums to 1."""
-    raise NotImplementedError
+    """submission.csv: eeg_id + the 6 class columns, rows in the order of test.csv, each row sums to 1."""
+    assert probs.shape == (len(test), len(CLASSES)), f"unexpected shape {probs.shape} for {len(test)} test rows"
+    assert np.isfinite(probs).all() and np.allclose(probs.sum(axis=1), 1, atol=1e-4), "probabilities are not valid"
+    sub = pd.DataFrame(probs, columns=CLASSES)
+    sub.insert(0, "eeg_id", test["eeg_id"].to_numpy())
+    sub.to_csv(path, index=False)
 
 
 def main():
-    """[easy] args -> seed/device -> load_data -> folds -> build_image_cache (train)
-    -> cross_validate_cnn (always on) -> build_image_cache (test) -> predict_test -> write_submission."""
-    raise NotImplementedError
+    """args -> seed/device -> (labels -> image cache -> cross-validation [-> blend analysis]) -> test images ->
+    fold-model predictions -> submission.csv.
+    --predict-only skips the training part (Kaggle inference notebook with the checkpoints attached);
+    --cv-only stops after the cross-validation."""
+    args = get_args()
+    set_seed(args.seed)
+    device = get_device()
+    t0 = time.time()
 
+    if not args.predict_only:
+        df = load_data(args)
+        images, index = build_image_cache(df, args.data_dir, args)
+        oof = cross_validate_cnn(df, images, index, args, device)
+        if args.hgb_oof is not None and not args.smoke and args.only_fold is None:
+            hgb = np.load(args.hgb_oof)
+            if hgb.shape != oof.shape:
+                print(f"warning: HGB predictions {hgb.shape} do not match the CNN predictions {oof.shape}; no blend")
+            else:
+                w, kl_all, kl_hi = blend_oof(oof, hgb, df[CLASSES].to_numpy(), df["num_votes"].to_numpy() >= 10)
+                print(f"blend: best weight for the CNN {w:.2f} -> KL all {kl_all:.4f}, >=10 votes {kl_hi:.4f}")
+        if args.cv_only:
+            print(f"done in {time.time() - t0:.0f}s")
+            return
 
-if __name__ == "__main__":
-    main()
+    test = pd.read_csv(args.data_dir / "test.csv")
+    images_test, index_test = build_image_cache(test, args.data_dir, args, is_test=True)
+    probs = predict_test(test, images_test, index_test, args, device)
+    write_submission(test, probs, args.output)
+    print(f"Saved {args.output} with {len(test)} rows (total {time.time() - t0:.0f}s)")
